@@ -1,4 +1,5 @@
 streamlit
 st-gsheets-connection
 pandas
-streamlit-js-eval pytz
+streamlit-js-eval
+pytz
