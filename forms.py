@@ -24,8 +24,8 @@ RAIO_MAXIMO_METROS = 9999999999999999999999  # raio em metros (300m é bem preci
 TURNOS = {
     "presenca_dia1_manha": {
         "label":  "📅 Dia 1 — Manhã",
-        "inicio": datetime(2026, 9, 9,  8,  40, tzinfo=FUSO),
-        "fim":    datetime(2026, 9, 9, 8, 44, tzinfo=FUSO),
+        "inicio": datetime(2026, 9, 9,  7,  40, tzinfo=FUSO),
+        "fim":    datetime(2026, 9, 9, 10, 00, tzinfo=FUSO),
     },
     "presenca_dia1_tarde": {
         "label":  "📅 Dia 1 — Tarde",
