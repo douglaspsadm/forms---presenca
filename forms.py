@@ -200,6 +200,13 @@ def retry_escrita(max_retries=3, initial_delay=2):
                         st.warning(f"⚠️ Tentativa de escrita {attempt + 1} falhou. Aguardando {delay}s...")
                         time.sleep(delay)
                         delay *= 2
+
+            # Se esgotou retries por ConflitoSimultaneo, retorna False silenciosamente.
+            # O usuário verá a mensagem de erro genérica da UI (não um crash do app).
+            if isinstance(last_exception, ConflitoSimultaneo):
+                return False
+
+            # Erro real — exibe e relança
             st.error(f"❌ Falha na escrita após {max_retries} tentativas: {str(last_exception)}")
             raise last_exception
         return wrapper
@@ -278,8 +285,9 @@ def adicionar_presenca(ies: str, participante: str, turno_col: str) -> bool:
     # ── PASSO 1: Leitura base (conn.read direto, sem cache) ───────
     # Em caso de retry por ConflitoSimultaneo, esta leitura já inclui
     # os dados do outro usuário → merge automático correto.
+    # ttl=0 → ignora cache do streamlit_gsheets, sempre lê da API
     presencas = garantir_colunas(
-        conn.read(worksheet="presencas", usecols=list(range(6)))
+        conn.read(worksheet="presencas", usecols=list(range(6)), ttl=0)
     )
 
     mask = presencas["nome_participante"] == participante
@@ -321,8 +329,11 @@ def adicionar_presenca(ies: str, participante: str, turno_col: str) -> bool:
     # para confirmar que nosso registro realmente está na planilha.
     time.sleep(1)
 
+    # ttl=0 → ignora cache do streamlit_gsheets, sempre lê da API
+    # SEM ttl=0 aqui, a verificação SEMPRE retorna dados antigos (cache de 30s)
+    # e o ConflitoSimultaneo é levantado mesmo quando a escrita foi bem-sucedida
     verificacao = garantir_colunas(
-        conn.read(worksheet="presencas", usecols=list(range(6)))
+        conn.read(worksheet="presencas", usecols=list(range(6)), ttl=0)
     )
 
     mask_verif = verificacao["nome_participante"] == participante
