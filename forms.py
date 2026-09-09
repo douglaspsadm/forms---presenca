@@ -226,61 +226,113 @@ def fazer_backup(conn, df_atual: pd.DataFrame) -> bool:
 @retry_escrita(max_retries=3, initial_delay=2)
 def adicionar_presenca(ies: str, participante: str, turno_col: str) -> bool:
     """
-    Registra presença com lógica INSERT ou UPDATE:
+    Registro com proteção contra concorrência.
 
-      Participante JÁ TEM LINHA → UPDATE só a coluna do turno
-      Participante NOVO         → INSERT nova linha
-
-    Cache SÓ é limpo APÓS escrita bem-sucedida, não antes.
+    Fluxo:
+      1. Lê estado atual
+      2. Valida presença duplicada
+      3. Faz leitura fresca imediatamente antes de gravar
+      4. Reaplica alteração na versão mais recente
+      5. Salva apenas uma vez
     """
+
     conn = st.connection('gsheets', type=GSheetsConnection)
 
-    # Leitura fresca direto — sem usar cache da UI
-    presencas    = conn.read(worksheet="presencas", usecols=list(range(6)))
-    presencas    = garantir_colunas(presencas)
-    n_antes      = len(presencas)
-    agora        = timestamp_agora()
+    agora = timestamp_agora()
+
+    # =====================================================
+    # LEITURA INICIAL
+    # =====================================================
+
+    presencas = conn.read(
+        worksheet="presencas",
+        usecols=list(range(6))
+    )
+
+    presencas = garantir_colunas(presencas)
 
     mask = presencas["nome_participante"] == participante
 
-    # Verificação dupla — garante que não houve registro entre a UI e o clique
     if mask.any():
-        valor_atual = presencas.loc[mask, turno_col].iloc[0]
+        valor_atual = presencas.loc[
+            mask,
+            turno_col
+        ].iloc[0]
+
         if celula_preenchida(valor_atual):
-            # Já registrou neste turno — aborta sem erro (UI já mostra aviso)
             return False
 
-    # Backup antes de qualquer alteração
-    fazer_backup(conn, presencas)
+    # =====================================================
+    # LEITURA FRESCA (ANTI-RACE CONDITION)
+    # =====================================================
 
-    if mask.any():
-        # ── UPDATE: participante já tem linha ────────────────────
-        # Atualiza SOMENTE a coluna do turno. Outros turnos preservados.
-        presencas.loc[mask, turno_col] = agora
-        data_final = presencas
+    presencas_fresca = conn.read(
+        worksheet="presencas",
+        usecols=list(range(6))
+    )
+
+    presencas_fresca = garantir_colunas(
+        presencas_fresca
+    )
+
+    mask_fresco = (
+        presencas_fresca["nome_participante"]
+        == participante
+    )
+
+    # Outro usuário pode ter acabado de registrar
+    if mask_fresco.any():
+
+        valor_atual = presencas_fresca.loc[
+            mask_fresco,
+            turno_col
+        ].iloc[0]
+
+        if celula_preenchida(valor_atual):
+            return False
+
+        presencas_fresca.loc[
+            mask_fresco,
+            turno_col
+        ] = agora
+
+        data_final = presencas_fresca
 
     else:
-        # ── INSERT: participante novo ─────────────────────────────
-        nova_linha = {col: "" for col in TODAS_COLUNAS}
+
+        nova_linha = {
+            col: ""
+            for col in TODAS_COLUNAS
+        }
+
         nova_linha["nome_participante"] = participante
-        nova_linha["nome_ies"]          = ies
-        nova_linha[turno_col]           = agora
+        nova_linha["nome_ies"] = ies
+        nova_linha[turno_col] = agora
+
         data_final = pd.concat(
-            [presencas, pd.DataFrame([nova_linha])],
+            [
+                presencas_fresca,
+                pd.DataFrame([nova_linha])
+            ],
             ignore_index=True
         )
 
-    # Validação de integridade
-    if len(data_final) < n_antes:
+    # =====================================================
+    # VALIDAÇÃO DE SEGURANÇA
+    # =====================================================
+
+    if len(data_final) < len(presencas_fresca):
         raise ValueError(
-            f"Abortado: DF ficou com {len(data_final)} linhas "
-            f"(era {n_antes}). Dados originais preservados."
+            "Tentativa de salvar menos linhas do que a planilha possui."
         )
 
-    conn.update(worksheet="presencas", data=data_final)
+    conn.update(
+        worksheet="presencas",
+        data=data_final
+    )
 
-    # ← cache limpo APENAS aqui, após escrita bem-sucedida
     st.cache_data.clear()
+
     return True
 
 
