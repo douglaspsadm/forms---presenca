@@ -55,25 +55,83 @@ TODAS_COLUNAS    = ["nome_participante", "nome_ies"] + COLUNAS_PRESENCA
 
 def timestamp_agora() -> str:
     """
-    Retorna timestamp atual em formato que o Google Sheets NÃO interpreta como data.
-    "04/11/2026 08:25" seria convertido para serial. "04-11-2026 08h25" não é.
+    Formato que o Google Sheets NÃO interpreta como data.
+    Barras e dois-pontos fazem o Sheets converter para serial float.
+    Usando traço e 'h' ele trata como texto puro.
     """
     return datetime.now(FUSO).strftime("%d-%m-%Y %Hh%M")
 
 
 def celula_preenchida(valor) -> bool:
-    """Retorna True se a célula tem um valor real (não vazio, não NaN)."""
+    """True se a célula tem valor real (não vazio, não NaN)."""
     if valor is None:
         return False
     return pd.notna(valor) and str(valor).strip() not in ("", "nan", "NaN", "None")
 
 
-# ══════════════════════════════════════════════════════════════════
-# DECORATOR RETRY — idêntico ao original
-# ══════════════════════════════════════════════════════════════════
+def garantir_colunas(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Garante que o DataFrame tenha todas as colunas na ordem correta,
+    e que as colunas de presença sejam dtype object (string).
 
-def retry_sheets_operation(max_retries=3, initial_delay=1):
-    """Decorator para operações do Google Sheets com retry e exponential backoff."""
+    FIX BUG 1: Quando o Sheets retorna colunas vazias, pandas as infere
+    como float64. Tentar salvar uma string nelas causa:
+      "Invalid value '09-09-2026 09h15' for dtype 'float64'"
+    A solução é forçar .astype(str) e limpar os "nan" strings.
+    """
+    df = df.copy()
+
+    # Cria colunas faltantes
+    for col in TODAS_COLUNAS:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Reordena
+    df = df[TODAS_COLUNAS]
+
+    # FIX: força dtype string em TODAS as colunas de presença
+    for col in COLUNAS_PRESENCA:
+        df[col] = (
+            df[col]
+            .fillna("")           # NaN → ""
+            .astype(str)          # float64 "nan" → string "nan"
+            .str.strip()
+            .replace({"nan": "", "NaN": "", "None": "", "NaT": ""})
+        )
+
+    # Garante string em nome_participante e nome_ies também
+    df["nome_participante"] = df["nome_participante"].fillna("").astype(str).str.strip()
+    df["nome_ies"]          = df["nome_ies"].fillna("").astype(str).str.strip()
+
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════
+# LEITURA — cache de 30s para respeitar quota da API
+# ══════════════════════════════════════════════════════════════════
+#
+# FIX BUG 2 — Rate limit:
+#
+# PROBLEMA ANTERIOR:
+#   ttl=1s → cache expira quase instantaneamente
+#   cache_data.clear() era chamado ANTES de ler (invalidava cache de todos)
+#   retry limpava cache a cada tentativa → efeito cascata com múltiplos usuários
+#
+# SOLUÇÃO:
+#   ttl=30s → cada usuário lê no máximo 2x/min individualmente
+#   cache_data.clear() APENAS após escrita bem-sucedida
+#   retry de leitura NÃO limpa cache (evita avalanche)
+#   backoff maior (initial_delay=2s)
+#
+# IMPORTANTE: a cota do Google Sheets é 60 leituras/min por service account,
+# compartilhada entre todos os usuários simultâneos. Com ttl=1s e 10 pessoas,
+# são ~600 req/min → estoura. Com ttl=30s e 10 pessoas → ~20 req/min → ok.
+
+def retry_leitura(max_retries=3, initial_delay=2):
+    """
+    Retry para leituras — NÃO limpa cache entre tentativas.
+    Limpar cache em retry de leitura causa avalanche quando há múltiplos usuários.
+    """
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -84,46 +142,59 @@ def retry_sheets_operation(max_retries=3, initial_delay=1):
                     result = func(*args, **kwargs)
                     if isinstance(result, tuple):
                         if any(isinstance(r, pd.DataFrame) and r.empty for r in result):
-                            raise ValueError("Received empty DataFrame")
+                            raise ValueError("DataFrame vazio")
                     elif isinstance(result, pd.DataFrame) and result.empty:
-                        raise ValueError("Received empty DataFrame")
+                        raise ValueError("DataFrame vazio")
                     return result
                 except Exception as e:
                     last_exception = e
                     if attempt < max_retries - 1:
-                        st.warning(f"Tentativa {attempt + 1} falhou. Tentando novamente em {delay} segundos...")
+                        st.warning(f"⚠️ Tentativa {attempt + 1} falhou. Aguardando {delay}s...")
                         time.sleep(delay)
-                        st.cache_data.clear()
+                        # NÃO limpa cache aqui — evita invalidar cache de outros usuários
                         delay *= 2
-            st.error(f"Todas as {max_retries} tentativas falharam. Último erro: {str(last_exception)}")
+            st.error(f"❌ Falha na leitura após {max_retries} tentativas: {str(last_exception)}")
             raise last_exception
         return wrapper
     return decorator
 
 
-# ══════════════════════════════════════════════════════════════════
-# LEITURA — com cache (para UI)
-# ══════════════════════════════════════════════════════════════════
+def retry_escrita(max_retries=3, initial_delay=2):
+    """
+    Retry para escritas — pode limpar cache após cada tentativa,
+    pois o objetivo é garantir que o dado seja salvo.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay          = initial_delay
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        st.warning(f"⚠️ Tentativa de escrita {attempt + 1} falhou. Aguardando {delay}s...")
+                        time.sleep(delay)
+                        delay *= 2
+            st.error(f"❌ Falha na escrita após {max_retries} tentativas: {str(last_exception)}")
+            raise last_exception
+        return wrapper
+    return decorator
 
-@st.cache_data(ttl=1)
-@retry_sheets_operation(max_retries=3, initial_delay=1)
+
+@st.cache_data(ttl=30)   # 30s: suficiente para não mostrar dado stale, mas respeitando quota
+@retry_leitura(max_retries=3, initial_delay=2)
 def ler_dados_sheets():
     """
-    Lê as duas abas principais com cache de 1s.
-    Idêntico ao original.
+    Lê presencas e lista_evento.
+    Cache de 30s — essencial para não estourar quota com múltiplos usuários.
     """
     conn         = st.connection('gsheets', type=GSheetsConnection)
     presencas    = conn.read(worksheet="presencas",    usecols=list(range(6)))
     lista_evento = conn.read(worksheet="lista_evento", usecols=[0, 1, 2])
     return presencas, lista_evento
-
-
-def garantir_colunas(df: pd.DataFrame) -> pd.DataFrame:
-    """Garante que o DataFrame tenha todas as colunas esperadas."""
-    for col in TODAS_COLUNAS:
-        if col not in df.columns:
-            df[col] = ""
-    return df[TODAS_COLUNAS]  # força a ordem correta das colunas
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -132,9 +203,8 @@ def garantir_colunas(df: pd.DataFrame) -> pd.DataFrame:
 
 def fazer_backup(conn, df_atual: pd.DataFrame) -> bool:
     """
-    Salva cópia de 'presencas' na aba 'backup' com timestamp.
-    Nunca salva DF vazio para não apagar backup anterior válido.
-    Falha no backup NÃO interrompe o registro.
+    Salva cópia em 'backup' com timestamp.
+    Nunca salva DF vazio. Falha não interrompe o fluxo principal.
     """
     try:
         if df_atual.empty:
@@ -150,92 +220,68 @@ def fazer_backup(conn, df_atual: pd.DataFrame) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════
-# REGISTRO DE PRESENÇA — CORRIGIDO
+# REGISTRO DE PRESENÇA
 # ══════════════════════════════════════════════════════════════════
 
-@retry_sheets_operation(max_retries=3, initial_delay=1)
+@retry_escrita(max_retries=3, initial_delay=2)
 def adicionar_presenca(ies: str, participante: str, turno_col: str) -> bool:
     """
-    Registra presença do participante no turno informado.
+    Registra presença com lógica INSERT ou UPDATE:
 
-    LÓGICA CORRIGIDA:
-    ─────────────────────────────────────────────────────────────────
-    ANTES (bugado): sempre fazia pd.concat → sempre criava nova linha
-                    → mesmo participante acumulava múltiplas linhas
+      Participante JÁ TEM LINHA → UPDATE só a coluna do turno
+      Participante NOVO         → INSERT nova linha
 
-    AGORA (correto):
-      • Participante JÁ TEM LINHA na planilha?
-          → UPDATE: preenche só a coluna do turno na linha existente
-          → sem nova linha, sem duplicata
-      • Participante NOVO?
-          → INSERT: cria uma única linha nova com os dados
-
-    Proteções adicionais:
-      • Backup antes de qualquer alteração
-      • Validação de integridade: DF final não pode ser menor que o lido
-      • Verificação dupla de presença já registrada (evita race condition)
-    ─────────────────────────────────────────────────────────────────
+    Cache SÓ é limpo APÓS escrita bem-sucedida, não antes.
     """
-    try:
-        conn = st.connection('gsheets', type=GSheetsConnection)
+    conn = st.connection('gsheets', type=GSheetsConnection)
 
-        # Limpa cache para garantir leitura fresca
-        st.cache_data.clear()
-        presencas, _ = ler_dados_sheets()
-        presencas = garantir_colunas(presencas)
+    # Leitura fresca direto — sem usar cache da UI
+    presencas    = conn.read(worksheet="presencas", usecols=list(range(6)))
+    presencas    = garantir_colunas(presencas)
+    n_antes      = len(presencas)
+    agora        = timestamp_agora()
 
-        n_linhas_antes = len(presencas)
-        agora          = timestamp_agora()
+    mask = presencas["nome_participante"] == participante
 
-        # Verificação dupla — proteção contra race condition
-        # (dois cliques rápidos antes do cache expirar)
-        mask = presencas["nome_participante"] == participante
-        if mask.any():
-            valor_atual = presencas.loc[mask, turno_col].iloc[0]
-            if celula_preenchida(valor_atual):
-                # Já registrou neste turno — aborta silenciosamente
-                return False
+    # Verificação dupla — garante que não houve registro entre a UI e o clique
+    if mask.any():
+        valor_atual = presencas.loc[mask, turno_col].iloc[0]
+        if celula_preenchida(valor_atual):
+            # Já registrou neste turno — aborta sem erro (UI já mostra aviso)
+            return False
 
-        # ── Backup antes de qualquer escrita ─────────────────────
-        fazer_backup(conn, presencas)
+    # Backup antes de qualquer alteração
+    fazer_backup(conn, presencas)
 
-        # ── INSERT ou UPDATE ──────────────────────────────────────
-        if mask.any():
-            # ✅ CASO 1: Participante JÁ TEM LINHA
-            # Atualiza SOMENTE a coluna do turno ativo.
-            # As outras colunas (outros turnos já registrados) ficam intactas.
-            presencas.loc[mask, turno_col] = agora
-            data_atualizada = presencas
+    if mask.any():
+        # ── UPDATE: participante já tem linha ────────────────────
+        # Atualiza SOMENTE a coluna do turno. Outros turnos preservados.
+        presencas.loc[mask, turno_col] = agora
+        data_final = presencas
 
-        else:
-            # ✅ CASO 2: Participante NOVO
-            # Cria uma linha nova com todos os campos vazios exceto o turno ativo.
-            nova_linha = {col: "" for col in TODAS_COLUNAS}
-            nova_linha["nome_participante"] = participante
-            nova_linha["nome_ies"]          = ies
-            nova_linha[turno_col]           = agora
+    else:
+        # ── INSERT: participante novo ─────────────────────────────
+        nova_linha = {col: "" for col in TODAS_COLUNAS}
+        nova_linha["nome_participante"] = participante
+        nova_linha["nome_ies"]          = ies
+        nova_linha[turno_col]           = agora
+        data_final = pd.concat(
+            [presencas, pd.DataFrame([nova_linha])],
+            ignore_index=True
+        )
 
-            data_atualizada = pd.concat(
-                [presencas, pd.DataFrame([nova_linha])],
-                ignore_index=True
-            )
+    # Validação de integridade
+    if len(data_final) < n_antes:
+        raise ValueError(
+            f"Abortado: DF ficou com {len(data_final)} linhas "
+            f"(era {n_antes}). Dados originais preservados."
+        )
 
-        # ── Validação de integridade ──────────────────────────────
-        # DF final nunca pode ser MENOR que o lido (proteção contra perda de dados)
-        if len(data_atualizada) < n_linhas_antes:
-            raise ValueError(
-                f"Abortado: DF ficou com {len(data_atualizada)} linhas "
-                f"(era {n_linhas_antes}). Dados originais preservados."
-            )
+    conn.update(worksheet="presencas", data=data_final)
 
-        # ── Salva ─────────────────────────────────────────────────
-        conn.update(worksheet="presencas", data=data_atualizada)
-        st.cache_data.clear()
-        return True
-
-    except Exception as e:
-        st.error(f"Erro ao registrar presença: {str(e)}")
-        return False
+    # ← cache limpo APENAS aqui, após escrita bem-sucedida
+    st.cache_data.clear()
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -272,7 +318,6 @@ def obter_localizacao():
 # ══════════════════════════════════════════════════════════════════
 
 def get_turno_ativo():
-    """Retorna (chave, label) do primeiro turno aberto no momento."""
     agora = datetime.now(FUSO)
     for chave, turno in TURNOS.items():
         if turno["inicio"] <= agora <= turno["fim"]:
@@ -281,7 +326,7 @@ def get_turno_ativo():
 
 
 # ══════════════════════════════════════════════════════════════════
-# HELPERS DE PARTICIPANTES — idênticos ao original
+# HELPERS DE PARTICIPANTES
 # ══════════════════════════════════════════════════════════════════
 
 def get_iniciais(nome):
@@ -322,7 +367,6 @@ def get_participantes_ies(ies_selecionada):
 
 
 def verificar_presenca_existente(participante, turno_col) -> bool:
-    """Retorna True se o participante já registrou presença neste turno."""
     presencas, _ = ler_dados_sheets()
     registro = presencas[presencas['nome_participante'] == participante]
     if registro.empty:
@@ -331,7 +375,6 @@ def verificar_presenca_existente(participante, turno_col) -> bool:
 
 
 def mostrar_historico(participante):
-    """Mostra o histórico completo de presenças do participante."""
     presencas, _ = ler_dados_sheets()
     registro = presencas[presencas['nome_participante'] == participante]
     if registro.empty:
@@ -341,7 +384,8 @@ def mostrar_historico(participante):
     for col in COLUNAS_PRESENCA:
         valor = row.get(col, "") or ""
         icone = "✅" if celula_preenchida(valor) else "⬜"
-        st.write(f"{icone} {TURNOS[col]['label']}: {valor if celula_preenchida(valor) else '—'}")
+        label = valor if celula_preenchida(valor) else "—"
+        st.write(f"{icone} {TURNOS[col]['label']}: {label}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -352,7 +396,7 @@ def main():
     # st.image(Image.open('logo.png').resize((400, 200)))
     st.title("✅ Lista de Presença — XI ENCES")
 
-    # Inicializa flag de proteção contra duplo clique
+    # Flag de proteção contra duplo clique
     if "registrando" not in st.session_state:
         st.session_state.registrando = False
 
@@ -377,7 +421,7 @@ def main():
     st.markdown("### 📍 Verificação de localização")
     st.caption(
         f"O registro só é permitido a até **{RAIO_MAXIMO_METROS}m** do local do evento. "
-        "Permita o acesso à sua localização quando solicitado pelo browser."
+        "Permita o acesso à sua localização quando solicitado."
     )
 
     loc = obter_localizacao()
@@ -452,20 +496,17 @@ def main():
 
     st.markdown("")
 
-    # ── Proteção contra duplo clique ─────────────────────────────
-    # O botão fica desabilitado enquanto o registro está em andamento.
-    # Isso impede que dois cliques rápidos gerem dois registros.
     submitted = st.button(
         "✅ Confirmar Presença",
         type="primary",
         use_container_width=True,
-        disabled=st.session_state.registrando   # ← desabilita após 1º clique
+        disabled=st.session_state.registrando
     )
 
     if submitted and not st.session_state.registrando:
         st.session_state.registrando = True
 
-        # Verificação dupla antes de salvar (proteção contra race condition)
+        # Verificação dupla (race condition entre UI e clique)
         if verificar_presenca_existente(nome_completo, turno_col):
             st.warning("⚠️ Presença já registrada para este turno.")
             mostrar_historico(nome_completo)
@@ -475,17 +516,15 @@ def main():
         with st.spinner("Registrando presença..."):
             sucesso = adicionar_presenca(ies, nome_completo, turno_col)
 
+        st.session_state.registrando = False
+
         if sucesso:
             st.success("🎉 **Presença registrada com sucesso!**")
             st.balloons()
-            st.cache_data.clear()
-            st.session_state.registrando = False
             time.sleep(2)
             st.rerun()
         else:
             st.error("Não foi possível registrar a presença. Por favor, tente novamente.")
-            st.cache_data.clear()
-            st.session_state.registrando = False
 
 
 if __name__ == "__main__":
