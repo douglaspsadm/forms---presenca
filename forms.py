@@ -19,7 +19,7 @@ FUSO = pytz.timezone("America/Sao_Paulo")
 
 EVENTO_LAT = -15.78798   # ← latitude do local do evento
 EVENTO_LON = -47.91416   # ← longitude do local do evento
-RAIO_MAXIMO_METROS = 4000  # raio em metros (300m é bem preciso para um prédio)
+RAIO_MAXIMO_METROS = 9999999999999999999999  # raio em metros (300m é bem preciso para um prédio)
 
 TURNOS = {
     "presenca_dia1_manha": {
