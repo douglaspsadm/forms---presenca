@@ -29,13 +29,13 @@ TURNOS = {
     },
     "presenca_dia1_tarde": {
         "label":  "📅 Dia 1 — Tarde",
-        "inicio": datetime(2026, 9, 9, 8, 45, tzinfo=FUSO),
-        "fim":    datetime(2026, 9, 9, 8, 49, tzinfo=FUSO),
+        "inicio": datetime(2026, 9, 9, 10, 40, tzinfo=FUSO),
+        "fim":    datetime(2026, 9, 9, 12, 49, tzinfo=FUSO),
     },
     "presenca_dia2_manha": {
         "label":  "📅 Dia 2 — Manhã",
-        "inicio": datetime(2026, 9, 9,  8,  50, tzinfo=FUSO),
-        "fim":    datetime(2026, 9, 9, 8, 54, tzinfo=FUSO),
+        "inicio": datetime(2026, 9, 9,  10,  10, tzinfo=FUSO),
+        "fim":    datetime(2026, 9, 9, 12, 00, tzinfo=FUSO),
     },
     "presenca_dia2_tarde": {
         "label":  "📅 Dia 2 — Tarde",
