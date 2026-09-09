@@ -49,8 +49,6 @@ COLUNAS_PRESENCA = list(TURNOS.keys())
 TODAS_COLUNAS    = ["nome_participante", "nome_ies"] + COLUNAS_PRESENCA
 
 
-
-
 # ══════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════
@@ -225,78 +223,65 @@ def fazer_backup(conn, df_atual: pd.DataFrame) -> bool:
 # REGISTRO DE PRESENÇA
 # ══════════════════════════════════════════════════════════════════
 
+@retry_escrita(max_retries=3, initial_delay=2)
 def adicionar_presenca(ies: str, participante: str, turno_col: str) -> bool:
     """
-    Registra presença. Fluxo simples e seguro — sem loop, sem releitura pós-save:
+    Registra presença com lógica INSERT ou UPDATE:
 
-    1. Lê planilha FRESCA (1 leitura apenas)
-    2. Se voltou vazia mas cache tem dados → aborta (falha de leitura, não apaga nada)
-    3. Verifica se já registrou neste turno → retorna False se sim (tudo ok)
-    4. Backup do estado atual
-    5. UPDATE se participante já tem linha / INSERT se é novo
-    6. Validação de integridade (DF final não pode ser menor que o lido)
-    7. Salva. Fim.
+      Participante JÁ TEM LINHA → UPDATE só a coluna do turno
+      Participante NOVO         → INSERT nova linha
+
+    Cache SÓ é limpo APÓS escrita bem-sucedida, não antes.
     """
-    try:
-        conn  = st.connection('gsheets', type=GSheetsConnection)
-        agora = timestamp_agora()
+    conn = st.connection('gsheets', type=GSheetsConnection)
 
-        # ── 1. Leitura fresca (sem cache) ─────────────────────────
-        presencas = conn.read(worksheet="presencas", usecols=list(range(6)))
-        presencas = garantir_colunas(presencas)
-        n_antes   = len(presencas)
+    # Leitura fresca direto — sem usar cache da UI
+    presencas    = conn.read(worksheet="presencas", usecols=list(range(6)))
+    presencas    = garantir_colunas(presencas)
+    n_antes      = len(presencas)
+    agora        = timestamp_agora()
 
-        # ── 2. Proteção contra leitura vazia ──────────────────────
-        # Planilha vazia + cache com dados = falha de leitura.
-        # Abortamos para não sobrescrever dados reais com DF vazio.
-        if presencas.empty:
-            cache_presencas, _ = ler_dados_sheets()
-            if not cache_presencas.empty:
-                st.error("❌ Falha temporária na leitura. Tente novamente em instantes.")
-                return False
+    mask = presencas["nome_participante"] == participante
 
-        # ── 3. Verifica se já registrou neste turno ───────────────
-        mask = presencas["nome_participante"] == participante
-        if mask.any():
-            valor_atual = presencas.loc[mask, turno_col].iloc[0]
-            if celula_preenchida(valor_atual):
-                # Já registrado neste turno — retorna False (a UI trata como "ok")
-                return False
+    # Verificação dupla — garante que não houve registro entre a UI e o clique
+    if mask.any():
+        valor_atual = presencas.loc[mask, turno_col].iloc[0]
+        if celula_preenchida(valor_atual):
+            # Já registrou neste turno — aborta sem erro (UI já mostra aviso)
+            return False
 
-        # ── 4. Backup antes de qualquer alteração ─────────────────
-        fazer_backup(conn, presencas)
+    # Backup antes de qualquer alteração
+    fazer_backup(conn, presencas)
 
-        # ── 5. INSERT ou UPDATE ───────────────────────────────────
-        if mask.any():
-            # Participante já tem linha → atualiza só a coluna deste turno
-            presencas.loc[mask, turno_col] = agora
-            data_final = presencas
-        else:
-            # Participante novo → insere linha
-            nova_linha = {col: "" for col in TODAS_COLUNAS}
-            nova_linha["nome_participante"] = participante
-            nova_linha["nome_ies"]          = ies
-            nova_linha[turno_col]           = agora
-            data_final = pd.concat(
-                [presencas, pd.DataFrame([nova_linha])],
-                ignore_index=True
-            )
+    if mask.any():
+        # ── UPDATE: participante já tem linha ────────────────────
+        # Atualiza SOMENTE a coluna do turno. Outros turnos preservados.
+        presencas.loc[mask, turno_col] = agora
+        data_final = presencas
 
-        # ── 6. Validação de integridade ───────────────────────────
-        if len(data_final) < n_antes:
-            raise ValueError(
-                f"Abortado por segurança: DF final tem {len(data_final)} linhas, "
-                f"era {n_antes}. Nada foi alterado."
-            )
+    else:
+        # ── INSERT: participante novo ─────────────────────────────
+        nova_linha = {col: "" for col in TODAS_COLUNAS}
+        nova_linha["nome_participante"] = participante
+        nova_linha["nome_ies"]          = ies
+        nova_linha[turno_col]           = agora
+        data_final = pd.concat(
+            [presencas, pd.DataFrame([nova_linha])],
+            ignore_index=True
+        )
 
-        # ── 7. Salva ──────────────────────────────────────────────
-        conn.update(worksheet="presencas", data=data_final)
-        st.cache_data.clear()
-        return True
+    # Validação de integridade
+    if len(data_final) < n_antes:
+        raise ValueError(
+            f"Abortado: DF ficou com {len(data_final)} linhas "
+            f"(era {n_antes}). Dados originais preservados."
+        )
 
-    except Exception as e:
-        st.error(f"Erro ao registrar presença: {str(e)}")
-        return False
+    conn.update(worksheet="presencas", data=data_final)
+
+    # ← cache limpo APENAS aqui, após escrita bem-sucedida
+    st.cache_data.clear()
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════
