@@ -49,6 +49,24 @@ COLUNAS_PRESENCA = list(TURNOS.keys())
 TODAS_COLUNAS    = ["nome_participante", "nome_ies"] + COLUNAS_PRESENCA
 
 
+# ══════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def timestamp_agora() -> str:
+    """
+    Retorna timestamp atual em formato que o Google Sheets NÃO interpreta como data.
+    "04/11/2026 08:25" seria convertido para serial. "04-11-2026 08h25" não é.
+    """
+    return datetime.now(FUSO).strftime("%d-%m-%Y %Hh%M")
+
+
+def celula_preenchida(valor) -> bool:
+    """Retorna True se a célula tem um valor real (não vazio, não NaN)."""
+    if valor is None:
+        return False
+    return pd.notna(valor) and str(valor).strip() not in ("", "nan", "NaN", "None")
+
 
 # ══════════════════════════════════════════════════════════════════
 # DECORATOR RETRY — idêntico ao original
@@ -84,16 +102,15 @@ def retry_sheets_operation(max_retries=3, initial_delay=1):
 
 
 # ══════════════════════════════════════════════════════════════════
-# LEITURA PRINCIPAL — com cache (para UI)
+# LEITURA — com cache (para UI)
 # ══════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=1)
 @retry_sheets_operation(max_retries=3, initial_delay=1)
 def ler_dados_sheets():
     """
-    Lê as duas abas principais.
-    Idêntico ao original — usado para exibição na UI (tem cache).
-    O retry já protege leituras normais.
+    Lê as duas abas principais com cache de 1s.
+    Idêntico ao original.
     """
     conn         = st.connection('gsheets', type=GSheetsConnection)
     presencas    = conn.read(worksheet="presencas",    usecols=list(range(6)))
@@ -101,34 +118,12 @@ def ler_dados_sheets():
     return presencas, lista_evento
 
 
-# ══════════════════════════════════════════════════════════════════
-# LEITURA FRESCA — sem cache (exclusiva para operações de escrita)
-# ══════════════════════════════════════════════════════════════════
-
-def ler_presencas_fresco(conn) -> pd.DataFrame:
-    """
-    Lê a aba 'presencas' direto do Sheets, sem cache.
-    Chamada apenas dentro de adicionar_presenca(), antes do update.
-
-    Tenta 3 vezes. Se todas falharem, retorna DF vazio estruturado
-    e o chamador decidirá se usa o backup ou aceita vazio (1ª inscrição).
-    """
-    for tentativa in range(3):
-        try:
-            df = conn.read(worksheet="presencas", usecols=list(range(6)))
-            # Garante que todas as colunas existam
-            for col in TODAS_COLUNAS:
-                if col not in df.columns:
-                    df[col] = ""
-            return df
-        except Exception as exc:
-            if tentativa < 2:
-                espera = 2 ** tentativa   # 1s, 2s
-                st.warning(f"⚠️ Leitura fresca falhou ({tentativa + 1}/3). Aguardando {espera}s...")
-                time.sleep(espera)
-
-    # Todas as tentativas falharam → retorna vazio estruturado
-    return pd.DataFrame(columns=TODAS_COLUNAS)
+def garantir_colunas(df: pd.DataFrame) -> pd.DataFrame:
+    """Garante que o DataFrame tenha todas as colunas esperadas."""
+    for col in TODAS_COLUNAS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[TODAS_COLUNAS]  # força a ordem correta das colunas
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -137,123 +132,103 @@ def ler_presencas_fresco(conn) -> pd.DataFrame:
 
 def fazer_backup(conn, df_atual: pd.DataFrame) -> bool:
     """
-    Salva cópia da aba 'presencas' na aba 'backup' com timestamp.
-
-    Regras de segurança:
-    - NUNCA salva DF vazio (evita apagar o último backup válido).
-    - Falha no backup NÃO interrompe o registro — apenas avisa.
-
-    Retorna True se backup foi salvo, False caso contrário.
+    Salva cópia de 'presencas' na aba 'backup' com timestamp.
+    Nunca salva DF vazio para não apagar backup anterior válido.
+    Falha no backup NÃO interrompe o registro.
     """
     try:
         if df_atual.empty:
-            # DF vazio pode ser falha de leitura — não apagar backup bom
-            st.warning("⚠️ Backup ignorado: leitura retornou vazio (possível falha de rede).")
+            st.warning("⚠️ Backup ignorado: DataFrame vazio.")
             return False
-
-        df_backup             = df_atual.copy()
-        df_backup["backup_em"] = datetime.now(FUSO).strftime("%d/%m/%Y %H:%M:%S")
+        df_backup              = df_atual.copy()
+        df_backup["backup_em"] = timestamp_agora()
         conn.update(worksheet="backup", data=df_backup)
         return True
-
     except Exception as exc:
-        # Backup falhou, mas os dados originais ainda estão intactos no Sheets
         st.warning(f"⚠️ Backup não realizado (dados principais NÃO afetados): {exc}")
         return False
 
 
-def recuperar_do_backup(conn) -> pd.DataFrame:
-    """
-    Tenta ler a aba 'backup' para recuperar dados em caso de leitura zerada.
-    Remove a coluna 'backup_em' antes de retornar para não poluir 'presencas'.
-
-    Usado APENAS quando ler_presencas_fresco() retornar vazio
-    mas soubermos que já havia dados (impossível ser a 1ª inscrição).
-    """
-    try:
-        df = conn.read(worksheet="backup", usecols=list(range(7)))  # 6 + backup_em
-        if "backup_em" in df.columns:
-            df = df.drop(columns=["backup_em"])
-        for col in TODAS_COLUNAS:
-            if col not in df.columns:
-                df[col] = ""
-        if not df.empty:
-            st.warning("⚠️ Dados recuperados do backup por falha na leitura principal.")
-        return df
-    except Exception:
-        return pd.DataFrame(columns=TODAS_COLUNAS)
-
-
 # ══════════════════════════════════════════════════════════════════
-# REGISTRO DE PRESENÇA
+# REGISTRO DE PRESENÇA — CORRIGIDO
 # ══════════════════════════════════════════════════════════════════
 
 @retry_sheets_operation(max_retries=3, initial_delay=1)
 def adicionar_presenca(ies: str, participante: str, turno_col: str) -> bool:
     """
-    Registra a presença do participante no turno informado.
+    Registra presença do participante no turno informado.
 
-    Fluxo (mesma lógica do original, com backup e proteção contra zerado):
+    LÓGICA CORRIGIDA:
+    ─────────────────────────────────────────────────────────────────
+    ANTES (bugado): sempre fazia pd.concat → sempre criava nova linha
+                    → mesmo participante acumulava múltiplas linhas
 
-    1. Limpa cache
-    2. Lê dados FRESCOS sem cache (3 tentativas)
-    3. Se leitura voltou vazia E já existiam registros → recupera do backup
-    4. Faz BACKUP do estado atual antes de qualquer alteração
-    5. Concatena novo registro
-    6. Valida integridade: DF final não pode ser MENOR que o lido
-    7. Faz update (igual ao original)
-    8. Limpa cache
+    AGORA (correto):
+      • Participante JÁ TEM LINHA na planilha?
+          → UPDATE: preenche só a coluna do turno na linha existente
+          → sem nova linha, sem duplicata
+      • Participante NOVO?
+          → INSERT: cria uma única linha nova com os dados
+
+    Proteções adicionais:
+      • Backup antes de qualquer alteração
+      • Validação de integridade: DF final não pode ser menor que o lido
+      • Verificação dupla de presença já registrada (evita race condition)
+    ─────────────────────────────────────────────────────────────────
     """
     try:
         conn = st.connection('gsheets', type=GSheetsConnection)
+
+        # Limpa cache para garantir leitura fresca
         st.cache_data.clear()
+        presencas, _ = ler_dados_sheets()
+        presencas = garantir_colunas(presencas)
 
-        # ── Passo 1: Leitura fresca (sem cache) ──────────────────
-        presencas  = ler_presencas_fresco(conn)
-        n_registros_lidos = len(presencas)
+        n_linhas_antes = len(presencas)
+        agora          = timestamp_agora()
 
-        # ── Passo 2: Recuperação do backup se necessário ──────────
-        # Se voltou vazio MAS a leitura cacheada (UI) tinha dados,
-        # é muito provável que seja falha de leitura, não planilha vazia.
-        if presencas.empty:
-            try:
-                presencas_cache, _ = ler_dados_sheets()
-                tinha_dados = not presencas_cache.empty
-            except Exception:
-                tinha_dados = False
+        # Verificação dupla — proteção contra race condition
+        # (dois cliques rápidos antes do cache expirar)
+        mask = presencas["nome_participante"] == participante
+        if mask.any():
+            valor_atual = presencas.loc[mask, turno_col].iloc[0]
+            if celula_preenchida(valor_atual):
+                # Já registrou neste turno — aborta silenciosamente
+                return False
 
-            if tinha_dados:
-                # Planilha deveria ter dados → tenta recuperar do backup
-                presencas = recuperar_do_backup(conn)
-
-        # ── Passo 3: Backup antes de alterar ─────────────────────
+        # ── Backup antes de qualquer escrita ─────────────────────
         fazer_backup(conn, presencas)
 
-        # ── Passo 4: Monta novo registro ─────────────────────────
-        agora = datetime.now(FUSO).strftime("%d/%m/%Y %H:%M:%S")
+        # ── INSERT ou UPDATE ──────────────────────────────────────
+        if mask.any():
+            # ✅ CASO 1: Participante JÁ TEM LINHA
+            # Atualiza SOMENTE a coluna do turno ativo.
+            # As outras colunas (outros turnos já registrados) ficam intactas.
+            presencas.loc[mask, turno_col] = agora
+            data_atualizada = presencas
 
-        novo_registro = pd.DataFrame({
-            "nome_participante": [participante],
-            "nome_ies":          [ies],
-            "presenca_dia1_manha":  [""],
-            "presenca_dia1_tarde":  [""],
-            "presenca_dia2_manha":  [""],
-            "presenca_dia2_tarde":  [""],
-        })
-        novo_registro[turno_col] = agora
+        else:
+            # ✅ CASO 2: Participante NOVO
+            # Cria uma linha nova com todos os campos vazios exceto o turno ativo.
+            nova_linha = {col: "" for col in TODAS_COLUNAS}
+            nova_linha["nome_participante"] = participante
+            nova_linha["nome_ies"]          = ies
+            nova_linha[turno_col]           = agora
 
-        data_atualizada = pd.concat([presencas, novo_registro], ignore_index=True)
-
-        # ── Passo 5: Validação de integridade ─────────────────────
-        # O DF final deve ter pelo menos 1 linha a mais que o lido.
-        # Se ficou menor, algo deu muito errado → aborta sem sobrescrever.
-        if len(data_atualizada) <= n_registros_lidos and n_registros_lidos > 0:
-            raise ValueError(
-                f"Abortado por segurança: DF ficou com {len(data_atualizada)} linhas "
-                f"após ter lido {n_registros_lidos}. Dados originais preservados."
+            data_atualizada = pd.concat(
+                [presencas, pd.DataFrame([nova_linha])],
+                ignore_index=True
             )
 
-        # ── Passo 6: Salva ────────────────────────────────────────
+        # ── Validação de integridade ──────────────────────────────
+        # DF final nunca pode ser MENOR que o lido (proteção contra perda de dados)
+        if len(data_atualizada) < n_linhas_antes:
+            raise ValueError(
+                f"Abortado: DF ficou com {len(data_atualizada)} linhas "
+                f"(era {n_linhas_antes}). Dados originais preservados."
+            )
+
+        # ── Salva ─────────────────────────────────────────────────
         conn.update(worksheet="presencas", data=data_atualizada)
         st.cache_data.clear()
         return True
@@ -268,7 +243,6 @@ def adicionar_presenca(ies: str, participante: str, turno_col: str) -> bool:
 # ══════════════════════════════════════════════════════════════════
 
 def calcular_distancia_metros(lat1, lon1, lat2, lon2) -> int:
-    """Fórmula de Haversine — retorna distância em metros."""
     R       = 6_371_000
     phi1    = math.radians(lat1)
     phi2    = math.radians(lat2)
@@ -311,8 +285,7 @@ def get_turno_ativo():
 # ══════════════════════════════════════════════════════════════════
 
 def get_iniciais(nome):
-    palavras = nome.split()
-    return ' '.join(palavra[0].upper() for palavra in palavras)
+    return ' '.join(palavra[0].upper() for palavra in nome.split())
 
 
 def get_ies_list():
@@ -325,8 +298,10 @@ def get_ies_list():
 
 def get_participantes_ies(ies_selecionada):
     _, lista_evento = ler_dados_sheets()
-    co_ies       = int(ies_selecionada.split(' - ')[0])
-    participantes = lista_evento[lista_evento['co_ies'].astype(int) == co_ies]['no_pessoa_fisica'].tolist()
+    co_ies        = int(ies_selecionada.split(' - ')[0])
+    participantes = lista_evento[
+        lista_evento['co_ies'].astype(int) == co_ies
+    ]['no_pessoa_fisica'].tolist()
 
     if 'mapeamento_nomes' not in st.session_state:
         st.session_state.mapeamento_nomes = {}
@@ -336,8 +311,8 @@ def get_participantes_ies(ies_selecionada):
         iniciais      = get_iniciais(nome)
         base_iniciais = iniciais
         contador      = 1
-        while iniciais in st.session_state.mapeamento_nomes and \
-              st.session_state.mapeamento_nomes[iniciais] != nome:
+        while (iniciais in st.session_state.mapeamento_nomes
+               and st.session_state.mapeamento_nomes[iniciais] != nome):
             iniciais = f"{base_iniciais} ({contador})"
             contador += 1
         st.session_state.mapeamento_nomes[iniciais] = nome
@@ -346,30 +321,27 @@ def get_participantes_ies(ies_selecionada):
     return participantes_iniciais
 
 
-def verificar_presenca_existente(participante, turno_col):
+def verificar_presenca_existente(participante, turno_col) -> bool:
     """Retorna True se o participante já registrou presença neste turno."""
     presencas, _ = ler_dados_sheets()
     registro = presencas[presencas['nome_participante'] == participante]
     if registro.empty:
         return False
-    valor = registro.iloc[0].get(turno_col, None)
-    return pd.notna(valor) and str(valor).strip() != ""
+    return celula_preenchida(registro.iloc[0].get(turno_col))
 
 
-def mostrar_presenca_existente(participante):
-    """Mostra o histórico de presenças do participante."""
+def mostrar_historico(participante):
+    """Mostra o histórico completo de presenças do participante."""
     presencas, _ = ler_dados_sheets()
     registro = presencas[presencas['nome_participante'] == participante]
     if registro.empty:
         return
     row = registro.iloc[0]
-    st.error("Você já possui registro de presença neste turno.")
     st.markdown("**Seu histórico de presenças:**")
     for col in COLUNAS_PRESENCA:
-        valor = row.get(col, "") or "—"
-        icone = "✅" if valor != "—" else "⬜"
-        st.write(f"{icone} {TURNOS[col]['label']}: {valor}")
-    st.warning("Não é permitido registrar presença mais de uma vez no mesmo turno.")
+        valor = row.get(col, "") or ""
+        icone = "✅" if celula_preenchida(valor) else "⬜"
+        st.write(f"{icone} {TURNOS[col]['label']}: {valor if celula_preenchida(valor) else '—'}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -380,6 +352,10 @@ def main():
     # st.image(Image.open('logo.png').resize((400, 200)))
     st.title("✅ Lista de Presença — XI ENCES")
 
+    # Inicializa flag de proteção contra duplo clique
+    if "registrando" not in st.session_state:
+        st.session_state.registrando = False
+
     # ── PASSO 1: Turno ativo ──────────────────────────────────────
     turno_col, turno_label = get_turno_ativo()
 
@@ -387,7 +363,11 @@ def main():
         st.warning("⏰ **Nenhum turno de presença está aberto no momento.**")
         st.markdown("#### Horários de registro:")
         for _, t in TURNOS.items():
-            st.write(f"• **{t['label']}**: {t['inicio'].strftime('%d/%m às %H:%M')} — {t['fim'].strftime('%H:%M')}h")
+            st.write(
+                f"• **{t['label']}**: "
+                f"{t['inicio'].strftime('%d/%m às %H:%M')} — "
+                f"{t['fim'].strftime('%H:%M')}h"
+            )
         return
 
     st.success(f"🟢 Turno aberto: **{turno_label}**")
@@ -429,56 +409,83 @@ def main():
     ies_options = ["Selecione uma IES..."] + list(get_ies_list())
     ies = st.selectbox("Selecione sua Instituição", options=ies_options)
 
-    if ies != "Selecione uma IES...":
+    if ies == "Selecione uma IES...":
+        return
 
-        # ── PASSO 4: Participante ─────────────────────────────────
-        participantes_iniciais = get_participantes_ies(ies)
+    # ── PASSO 4: Participante ─────────────────────────────────────
+    participantes_iniciais = get_participantes_ies(ies)
 
-        if participantes_iniciais:
-            participante_iniciais = st.selectbox(
-                "Selecione o Participante",
-                options=["Selecione um participante..."] + participantes_iniciais
-            )
+    if not participantes_iniciais:
+        st.error("Nenhum participante encontrado para esta IES")
+        return
 
-            if participante_iniciais != "Selecione um participante...":
-                nome_completo = st.session_state.mapeamento_nomes[participante_iniciais]
+    participante_iniciais = st.selectbox(
+        "Selecione o Participante",
+        options=["Selecione um participante..."] + participantes_iniciais
+    )
 
-                # ── PASSO 5: Presença duplicada ───────────────────
-                if verificar_presenca_existente(nome_completo, turno_col):
-                    mostrar_presenca_existente(nome_completo)
-                    return
+    if participante_iniciais == "Selecione um participante...":
+        return
 
-                # ── PASSO 6: Confirmar e registrar ────────────────
-                st.divider()
-                st.markdown("### 📋 Confirmação de Presença")
+    nome_completo = st.session_state.mapeamento_nomes[participante_iniciais]
 
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown(f"**Participante:** {participante_iniciais}")
-                    st.markdown(f"**IES:** {ies}")
-                with col2:
-                    st.markdown(f"**Turno:** {turno_label}")
-                    st.markdown(f"**Localização:** ✅ {distancia}m do evento")
+    # ── PASSO 5: Verifica presença duplicada ──────────────────────
+    if verificar_presenca_existente(nome_completo, turno_col):
+        st.warning(
+            f"⚠️ **{participante_iniciais}** já registrou presença para **{turno_label}**.\n\n"
+            "Não é permitido registrar presença mais de uma vez no mesmo turno."
+        )
+        mostrar_historico(nome_completo)
+        return
 
-                submitted = st.button("✅ Confirmar Presença", type="primary", use_container_width=True)
+    # ── PASSO 6: Confirmar ────────────────────────────────────────
+    st.divider()
+    st.markdown("### 📋 Confirmação de Presença")
 
-                if submitted:
-                    # Verificação dupla antes de salvar
-                    if verificar_presenca_existente(nome_completo, turno_col):
-                        mostrar_presenca_existente(nome_completo)
-                        return
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(f"**Participante:** {participante_iniciais}")
+        st.markdown(f"**IES:** {ies}")
+    with col2:
+        st.markdown(f"**Turno:** {turno_label}")
+        st.markdown(f"**Localização:** ✅ {distancia}m do evento")
 
-                    if adicionar_presenca(ies, nome_completo, turno_col):
-                        st.success("🎉 **Presença registrada com sucesso!**")
-                        st.balloons()
-                        st.cache_data.clear()
-                        time.sleep(2)
-                        st.rerun()
-                    else:
-                        st.error("Não foi possível registrar a presença. Por favor, tente novamente.")
-                        st.cache_data.clear()
+    st.markdown("")
+
+    # ── Proteção contra duplo clique ─────────────────────────────
+    # O botão fica desabilitado enquanto o registro está em andamento.
+    # Isso impede que dois cliques rápidos gerem dois registros.
+    submitted = st.button(
+        "✅ Confirmar Presença",
+        type="primary",
+        use_container_width=True,
+        disabled=st.session_state.registrando   # ← desabilita após 1º clique
+    )
+
+    if submitted and not st.session_state.registrando:
+        st.session_state.registrando = True
+
+        # Verificação dupla antes de salvar (proteção contra race condition)
+        if verificar_presenca_existente(nome_completo, turno_col):
+            st.warning("⚠️ Presença já registrada para este turno.")
+            mostrar_historico(nome_completo)
+            st.session_state.registrando = False
+            return
+
+        with st.spinner("Registrando presença..."):
+            sucesso = adicionar_presenca(ies, nome_completo, turno_col)
+
+        if sucesso:
+            st.success("🎉 **Presença registrada com sucesso!**")
+            st.balloons()
+            st.cache_data.clear()
+            st.session_state.registrando = False
+            time.sleep(2)
+            st.rerun()
         else:
-            st.error("Nenhum participante encontrado para esta IES")
+            st.error("Não foi possível registrar a presença. Por favor, tente novamente.")
+            st.cache_data.clear()
+            st.session_state.registrando = False
 
 
 if __name__ == "__main__":
