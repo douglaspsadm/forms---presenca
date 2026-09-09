@@ -49,6 +49,7 @@ COLUNAS_PRESENCA = list(TURNOS.keys())
 TODAS_COLUNAS    = ["nome_participante", "nome_ies"] + COLUNAS_PRESENCA
 
 
+
 # ══════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════
@@ -223,65 +224,133 @@ def fazer_backup(conn, df_atual: pd.DataFrame) -> bool:
 # REGISTRO DE PRESENÇA
 # ══════════════════════════════════════════════════════════════════
 
-@retry_escrita(max_retries=3, initial_delay=2)
+def _ler_presencas_fresco(conn) -> pd.DataFrame:
+    """Lê a aba 'presencas' direto do Sheets, sem cache. Usada em escrita e verificação."""
+    df = conn.read(worksheet="presencas", usecols=list(range(6)))
+    return garantir_colunas(df)
+
+
+def _verificar_salvo(conn, participante: str, turno_col: str, timestamp: str) -> bool:
+    """
+    Lê a planilha diretamente após o update e confirma que o registro está lá.
+
+    Verifica duas coisas:
+      1. O participante tem uma linha na planilha
+      2. A coluna do turno contém exatamente o timestamp que acabamos de salvar
+
+    Isso detecta race condition: se outra pessoa sobrescreveu logo após nosso
+    update, o timestamp não vai bater e sabemos que precisamos retentar.
+    """
+    time.sleep(1)  # pequena pausa para o Sheets propagar a escrita
+    df   = _ler_presencas_fresco(conn)
+    mask = df["nome_participante"] == participante
+    if not mask.any():
+        return False
+    valor = df.loc[mask, turno_col].iloc[0]
+    return str(valor).strip() == timestamp
+
+
 def adicionar_presenca(ies: str, participante: str, turno_col: str) -> bool:
     """
-    Registra presença com lógica INSERT ou UPDATE:
+    Registra presença com INSERT ou UPDATE + verificação pós-save.
 
-      Participante JÁ TEM LINHA → UPDATE só a coluna do turno
-      Participante NOVO         → INSERT nova linha
-
-    Cache SÓ é limpo APÓS escrita bem-sucedida, não antes.
+    Fluxo completo (até MAX_TENTATIVAS_SAVE vezes):
+    ──────────────────────────────────────────────────────────────
+    1. Lê planilha FRESCA (sem cache)
+    2. Verifica se já registrou neste turno → aborta se sim
+    3. Faz backup do estado atual
+    4. Monta data_final (UPDATE se já tem linha, INSERT se novo)
+    5. Valida integridade (data_final não pode ser menor que lido)
+    6. Salva com conn.update()
+    7. ✅ NOVO: Verifica se o registro realmente está lá após salvar
+         - Se SIM → sucesso
+         - Se NÃO → alguém sobrescreveu (race condition) → retorna ao passo 1
+    ──────────────────────────────────────────────────────────────
+    Race condition tratada:
+      Pessoa A salva às 09h15:01 → verifica → está lá ✅
+      Pessoa B leu antes de A salvar → B salva → sobrescreve A
+      A verifica → timestamp dela não está mais lá → A retenta
+      A lê de novo (agora com dado de B) → A concatena o próprio dado → salva
+      Ambas ficam salvas ✅
     """
-    conn = st.connection('gsheets', type=GSheetsConnection)
+    MAX_TENTATIVAS_SAVE = 5   # máximo de tentativas completas (lê→salva→verifica)
+    DELAY_ENTRE_TENTATIVAS = 2  # segundos entre tentativas
 
-    # Leitura fresca direto — sem usar cache da UI
-    presencas    = conn.read(worksheet="presencas", usecols=list(range(6)))
-    presencas    = garantir_colunas(presencas)
-    n_antes      = len(presencas)
-    agora        = timestamp_agora()
+    conn  = st.connection('gsheets', type=GSheetsConnection)
+    agora = timestamp_agora()  # timestamp fixo — mesmo em retentativas
 
-    mask = presencas["nome_participante"] == participante
+    for tentativa in range(1, MAX_TENTATIVAS_SAVE + 1):
 
-    # Verificação dupla — garante que não houve registro entre a UI e o clique
-    if mask.any():
-        valor_atual = presencas.loc[mask, turno_col].iloc[0]
-        if celula_preenchida(valor_atual):
-            # Já registrou neste turno — aborta sem erro (UI já mostra aviso)
-            return False
+        try:
+            # ── Passo 1: Leitura fresca ───────────────────────────
+            presencas = _ler_presencas_fresco(conn)
+            n_antes   = len(presencas)
+            mask      = presencas["nome_participante"] == participante
 
-    # Backup antes de qualquer alteração
-    fazer_backup(conn, presencas)
+            # ── Passo 2: Verificação de duplicata ─────────────────
+            if mask.any():
+                valor_atual = presencas.loc[mask, turno_col].iloc[0]
+                if celula_preenchida(valor_atual):
+                    # Já está registrado (talvez por tentativa anterior)
+                    return False
 
-    if mask.any():
-        # ── UPDATE: participante já tem linha ────────────────────
-        # Atualiza SOMENTE a coluna do turno. Outros turnos preservados.
-        presencas.loc[mask, turno_col] = agora
-        data_final = presencas
+            # ── Passo 3: Backup ───────────────────────────────────
+            fazer_backup(conn, presencas)
 
-    else:
-        # ── INSERT: participante novo ─────────────────────────────
-        nova_linha = {col: "" for col in TODAS_COLUNAS}
-        nova_linha["nome_participante"] = participante
-        nova_linha["nome_ies"]          = ies
-        nova_linha[turno_col]           = agora
-        data_final = pd.concat(
-            [presencas, pd.DataFrame([nova_linha])],
-            ignore_index=True
-        )
+            # ── Passo 4: Monta data_final ─────────────────────────
+            if mask.any():
+                # UPDATE: participante já tem linha
+                presencas.loc[mask, turno_col] = agora
+                data_final = presencas
+            else:
+                # INSERT: participante novo
+                nova_linha = {col: "" for col in TODAS_COLUNAS}
+                nova_linha["nome_participante"] = participante
+                nova_linha["nome_ies"]          = ies
+                nova_linha[turno_col]           = agora
+                data_final = pd.concat(
+                    [presencas, pd.DataFrame([nova_linha])],
+                    ignore_index=True
+                )
 
-    # Validação de integridade
-    if len(data_final) < n_antes:
-        raise ValueError(
-            f"Abortado: DF ficou com {len(data_final)} linhas "
-            f"(era {n_antes}). Dados originais preservados."
-        )
+            # ── Passo 5: Validação de integridade ─────────────────
+            if len(data_final) < n_antes:
+                raise ValueError(
+                    f"Abortado: DF ficou com {len(data_final)} linhas "
+                    f"(era {n_antes}). Dados originais preservados."
+                )
 
-    conn.update(worksheet="presencas", data=data_final)
+            # ── Passo 6: Salva ────────────────────────────────────
+            conn.update(worksheet="presencas", data=data_final)
 
-    # ← cache limpo APENAS aqui, após escrita bem-sucedida
-    st.cache_data.clear()
-    return True
+            # ── Passo 7: Verifica se realmente foi salvo ──────────
+            if _verificar_salvo(conn, participante, turno_col, agora):
+                # ✅ Confirmado — registro está na planilha
+                st.cache_data.clear()
+                return True
+
+            # ❌ Não encontrou o registro após salvar = race condition
+            if tentativa < MAX_TENTATIVAS_SAVE:
+                st.warning(
+                    f"⚠️ Registro não confirmado (tentativa {tentativa}/{MAX_TENTATIVAS_SAVE}). "
+                    f"Reprocessando em {DELAY_ENTRE_TENTATIVAS}s..."
+                )
+                time.sleep(DELAY_ENTRE_TENTATIVAS)
+            else:
+                st.error(
+                    f"❌ Não foi possível confirmar o registro após {MAX_TENTATIVAS_SAVE} tentativas."
+                )
+                return False
+
+        except Exception as exc:
+            if tentativa < MAX_TENTATIVAS_SAVE:
+                st.warning(f"⚠️ Tentativa {tentativa} falhou: {exc}. Aguardando {DELAY_ENTRE_TENTATIVAS}s...")
+                time.sleep(DELAY_ENTRE_TENTATIVAS)
+            else:
+                st.error(f"❌ Erro ao registrar presença: {exc}")
+                return False
+
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════
