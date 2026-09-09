@@ -227,92 +227,108 @@ def fazer_backup(conn, df_atual: pd.DataFrame) -> bool:
 @retry_escrita(max_retries=3, initial_delay=2)
 def adicionar_presenca(ies: str, participante: str, turno_col: str) -> bool:
     """
-    Registra presença com lógica INSERT ou UPDATE e proteção contra race condition.
+    Registra presença com proteção real contra conflito simultâneo.
 
-    Fluxo:
-      1. Leitura inicial — valida duplicidade e captura n_antes (versão atual)
-      2. Leitura FRESCA imediatamente antes de gravar (anti-race condition)
-         • Planilha não mudou  → grava normalmente
-         • Outro usuário gravou antes → merge automático na versão mais recente,
-           preservando o registro dele e adicionando o registro atual
-      3. Reaplica APENAS a alteração do usuário atual sobre a versão fresca
-      4. Salva uma única vez
+    Problema do "mesmo segundo":
+      Dois usuários lêem a planilha no mesmo instante (ex: 100 linhas).
+      Ambos gravam 101 linhas — o segundo sobrescreve o primeiro.
+      Leitura fresca antes de gravar NÃO resolve, pois ambos lêem
+      o mesmo estado antes de qualquer um ter gravado.
 
-    Consumo de API por registro:
-      • 2 leituras (inicial + fresca)
-      • 1 escrita — sem retry desnecessário, sem estourar quota
+    Solução — verificação pós-escrita:
+      1. Lê planilha (base para merge)
+      2. Aplica alteração e grava
+      3. Aguarda 1s e lê novamente para CONFIRMAR que o registro está lá
+      4. Se não estiver → alguém sobrescreveu no mesmo instante
+         → lança RuntimeError → retry_escrita aguarda e tenta de novo
+      5. Na nova tentativa, a leitura já inclui o registro do outro usuário
+         → merge correto → nenhum dado perdido
+
+    Consumo de API por registro (caso normal):
+      • 2 leituras (base + verificação pós-escrita)
+      • 1 escrita
+    Em caso de conflito real (raro):
+      • +2 leituras e +1 escrita na retentativa
     """
     conn  = st.connection('gsheets', type=GSheetsConnection)
     agora = timestamp_agora()
 
-    # ── PASSO 1: Leitura inicial ──────────────────────────────────
-    # Valida duplicidade e captura n_antes como "versão" da planilha.
+    # ── PASSO 1: Leitura base (para merge e checagem de duplicidade) ──
     presencas = garantir_colunas(
         conn.read(worksheet="presencas", usecols=list(range(6)))
     )
-    n_antes = len(presencas)
 
     mask = presencas["nome_participante"] == participante
 
-    # Verificação dupla — garante que não houve registro entre a UI e o clique
+    # Checagem de duplicidade — aborta se já registrou neste turno
     if mask.any():
         valor_atual = presencas.loc[mask, turno_col].iloc[0]
         if celula_preenchida(valor_atual):
-            # Já registrou neste turno — aborta sem erro (UI já mostra aviso)
-            return False
+            return False  # Já registrou — UI já exibe aviso, não precisa de erro
 
-    # ── PASSO 2: Leitura FRESCA (anti-race condition) ─────────────
-    # Captura o estado mais recente da planilha antes de gravar.
-    # Se outro usuário gravou entre a leitura inicial e agora, suas linhas
-    # estarão aqui — fazemos merge automático, nenhum dado é perdido.
-    presencas_fresca = garantir_colunas(
-        conn.read(worksheet="presencas", usecols=list(range(6)))
-    )
-
-    # Verificação de versão: planilha foi alterada por outro usuário?
-    # Não abortamos — aplicamos nossa alteração sobre a versão mais recente.
-    if len(presencas_fresca) != n_antes:
-        # Outro usuário gravou enquanto este processava.
-        # Continuamos normalmente usando presencas_fresca como base,
-        # garantindo que o registro dele seja preservado.
-        pass
-
-    mask_fresca = presencas_fresca["nome_participante"] == participante
-
-    # Verificação extra: participante foi registrado durante o processamento?
-    if mask_fresca.any():
-        valor_fresco = presencas_fresca.loc[mask_fresca, turno_col].iloc[0]
-        if celula_preenchida(valor_fresco):
-            # Outro processo registrou este mesmo participante — aborta
-            return False
-
-        # ── UPDATE: participante já tem linha na versão fresca ────
-        # Atualiza SOMENTE a coluna do turno. Outros turnos preservados.
-        presencas_fresca.loc[mask_fresca, turno_col] = agora
-        data_final = presencas_fresca
-
+    # ── PASSO 2: Monta data_final sobre a leitura base ────────────
+    if mask.any():
+        # UPDATE: participante já tem linha — atualiza só o turno atual
+        presencas.loc[mask, turno_col] = agora
+        data_final = presencas
     else:
-        # ── INSERT: participante novo ─────────────────────────────
+        # INSERT: participante novo — adiciona linha ao final
         nova_linha = {col: "" for col in TODAS_COLUNAS}
         nova_linha["nome_participante"] = participante
         nova_linha["nome_ies"]          = ies
         nova_linha[turno_col]           = agora
         data_final = pd.concat(
-            [presencas_fresca, pd.DataFrame([nova_linha])],
+            [presencas, pd.DataFrame([nova_linha])],
             ignore_index=True
         )
 
-    # ── PASSO 3: Validação de integridade ─────────────────────────
-    if len(data_final) < len(presencas_fresca):
+    # Validação de integridade antes de gravar
+    if len(data_final) < len(presencas):
         raise ValueError(
             f"Abortado: DF ficou com {len(data_final)} linhas "
-            f"(era {len(presencas_fresca)}). Dados originais preservados."
+            f"(era {len(presencas)}). Dados originais preservados."
         )
 
-    # ── PASSO 4: Gravação única ───────────────────────────────────
+    # ── PASSO 3: Grava ───────────────────────────────────────────
     conn.update(worksheet="presencas", data=data_final)
 
-    # Cache limpo APENAS após escrita bem-sucedida
+    # ── PASSO 4: Verificação pós-escrita (anti "mesmo segundo") ──
+    #
+    # Aguarda 1s para o Google Sheets propagar a escrita,
+    # depois lê novamente e confirma que nosso registro está lá.
+    #
+    # Cenário de conflito:
+    #   A grava 101 linhas (A)
+    #   B grava 101 linhas (B) ← sobrescreve A no mesmo instante
+    #   A verifica → A não está → RuntimeError → retry_escrita aguarda 2s
+    #   A tenta novamente → lê 101 linhas (B já está lá) → merge → grava 102 linhas
+    #   B verifica → B está lá → sucesso ✅
+    #   A verifica → A está lá → sucesso ✅
+    #
+    time.sleep(1)
+
+    verificacao = garantir_colunas(
+        conn.read(worksheet="presencas", usecols=list(range(6)))
+    )
+
+    mask_verif = verificacao["nome_participante"] == participante
+    registro_confirmado = (
+        mask_verif.any()
+        and celula_preenchida(
+            verificacao.loc[mask_verif, turno_col].iloc[0]
+        )
+    )
+
+    if not registro_confirmado:
+        # Conflito simultâneo detectado — retry_escrita vai tentar novamente.
+        # Na próxima tentativa, a leitura base já terá o registro do outro usuário,
+        # garantindo merge correto sem perda de dados.
+        raise RuntimeError(
+            "Conflito simultâneo: registro não confirmado na planilha. "
+            "Fazendo nova tentativa com dados atualizados..."
+        )
+
+    # Cache limpo SOMENTE após confirmação real da escrita
     st.cache_data.clear()
     return True
 
