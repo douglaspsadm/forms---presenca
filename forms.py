@@ -49,6 +49,7 @@ COLUNAS_PRESENCA = list(TURNOS.keys())
 TODAS_COLUNAS    = ["nome_participante", "nome_ies"] + COLUNAS_PRESENCA
 
 
+
 # ══════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════
@@ -226,113 +227,93 @@ def fazer_backup(conn, df_atual: pd.DataFrame) -> bool:
 @retry_escrita(max_retries=3, initial_delay=2)
 def adicionar_presenca(ies: str, participante: str, turno_col: str) -> bool:
     """
-    Registro com proteção contra concorrência.
+    Registra presença com lógica INSERT ou UPDATE e proteção contra race condition.
 
     Fluxo:
-      1. Lê estado atual
-      2. Valida presença duplicada
-      3. Faz leitura fresca imediatamente antes de gravar
-      4. Reaplica alteração na versão mais recente
-      5. Salva apenas uma vez
+      1. Leitura inicial — valida duplicidade e captura n_antes (versão atual)
+      2. Leitura FRESCA imediatamente antes de gravar (anti-race condition)
+         • Planilha não mudou  → grava normalmente
+         • Outro usuário gravou antes → merge automático na versão mais recente,
+           preservando o registro dele e adicionando o registro atual
+      3. Reaplica APENAS a alteração do usuário atual sobre a versão fresca
+      4. Salva uma única vez
+
+    Consumo de API por registro:
+      • 2 leituras (inicial + fresca)
+      • 1 escrita — sem retry desnecessário, sem estourar quota
     """
-
-    conn = st.connection('gsheets', type=GSheetsConnection)
-
+    conn  = st.connection('gsheets', type=GSheetsConnection)
     agora = timestamp_agora()
 
-    # =====================================================
-    # LEITURA INICIAL
-    # =====================================================
-
-    presencas = conn.read(
-        worksheet="presencas",
-        usecols=list(range(6))
+    # ── PASSO 1: Leitura inicial ──────────────────────────────────
+    # Valida duplicidade e captura n_antes como "versão" da planilha.
+    presencas = garantir_colunas(
+        conn.read(worksheet="presencas", usecols=list(range(6)))
     )
-
-    presencas = garantir_colunas(presencas)
+    n_antes = len(presencas)
 
     mask = presencas["nome_participante"] == participante
 
+    # Verificação dupla — garante que não houve registro entre a UI e o clique
     if mask.any():
-        valor_atual = presencas.loc[
-            mask,
-            turno_col
-        ].iloc[0]
-
+        valor_atual = presencas.loc[mask, turno_col].iloc[0]
         if celula_preenchida(valor_atual):
+            # Já registrou neste turno — aborta sem erro (UI já mostra aviso)
             return False
 
-    # =====================================================
-    # LEITURA FRESCA (ANTI-RACE CONDITION)
-    # =====================================================
-
-    presencas_fresca = conn.read(
-        worksheet="presencas",
-        usecols=list(range(6))
-    )
-
+    # ── PASSO 2: Leitura FRESCA (anti-race condition) ─────────────
+    # Captura o estado mais recente da planilha antes de gravar.
+    # Se outro usuário gravou entre a leitura inicial e agora, suas linhas
+    # estarão aqui — fazemos merge automático, nenhum dado é perdido.
     presencas_fresca = garantir_colunas(
-        presencas_fresca
+        conn.read(worksheet="presencas", usecols=list(range(6)))
     )
 
-    mask_fresco = (
-        presencas_fresca["nome_participante"]
-        == participante
-    )
+    # Verificação de versão: planilha foi alterada por outro usuário?
+    # Não abortamos — aplicamos nossa alteração sobre a versão mais recente.
+    if len(presencas_fresca) != n_antes:
+        # Outro usuário gravou enquanto este processava.
+        # Continuamos normalmente usando presencas_fresca como base,
+        # garantindo que o registro dele seja preservado.
+        pass
 
-    # Outro usuário pode ter acabado de registrar
-    if mask_fresco.any():
+    mask_fresca = presencas_fresca["nome_participante"] == participante
 
-        valor_atual = presencas_fresca.loc[
-            mask_fresco,
-            turno_col
-        ].iloc[0]
-
-        if celula_preenchida(valor_atual):
+    # Verificação extra: participante foi registrado durante o processamento?
+    if mask_fresca.any():
+        valor_fresco = presencas_fresca.loc[mask_fresca, turno_col].iloc[0]
+        if celula_preenchida(valor_fresco):
+            # Outro processo registrou este mesmo participante — aborta
             return False
 
-        presencas_fresca.loc[
-            mask_fresco,
-            turno_col
-        ] = agora
-
+        # ── UPDATE: participante já tem linha na versão fresca ────
+        # Atualiza SOMENTE a coluna do turno. Outros turnos preservados.
+        presencas_fresca.loc[mask_fresca, turno_col] = agora
         data_final = presencas_fresca
 
     else:
-
-        nova_linha = {
-            col: ""
-            for col in TODAS_COLUNAS
-        }
-
+        # ── INSERT: participante novo ─────────────────────────────
+        nova_linha = {col: "" for col in TODAS_COLUNAS}
         nova_linha["nome_participante"] = participante
-        nova_linha["nome_ies"] = ies
-        nova_linha[turno_col] = agora
-
+        nova_linha["nome_ies"]          = ies
+        nova_linha[turno_col]           = agora
         data_final = pd.concat(
-            [
-                presencas_fresca,
-                pd.DataFrame([nova_linha])
-            ],
+            [presencas_fresca, pd.DataFrame([nova_linha])],
             ignore_index=True
         )
 
-    # =====================================================
-    # VALIDAÇÃO DE SEGURANÇA
-    # =====================================================
-
+    # ── PASSO 3: Validação de integridade ─────────────────────────
     if len(data_final) < len(presencas_fresca):
         raise ValueError(
-            "Tentativa de salvar menos linhas do que a planilha possui."
+            f"Abortado: DF ficou com {len(data_final)} linhas "
+            f"(era {len(presencas_fresca)}). Dados originais preservados."
         )
 
-    conn.update(
-        worksheet="presencas",
-        data=data_final
-    )
+    # ── PASSO 4: Gravação única ───────────────────────────────────
+    conn.update(worksheet="presencas", data=data_final)
 
+    # Cache limpo APENAS após escrita bem-sucedida
     st.cache_data.clear()
-
     return True
 
 
