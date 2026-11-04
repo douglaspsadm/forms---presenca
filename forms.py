@@ -24,23 +24,23 @@ RAIO_MAXIMO_METROS = 2000  # raio em metros (300m é bem preciso para um prédio
 TURNOS = {
     "presenca_dia1_manha": {
         "label":  "📅 Dia 1 — Manhã",
-        "inicio": datetime(2026, 10, 4,  7,  00, tzinfo=FUSO),
-        "fim":    datetime(2026, 10, 4, 12, 00, tzinfo=FUSO),
+        "inicio": datetime(2026, 11, 4,  7,  00, tzinfo=FUSO),
+        "fim":    datetime(2026, 11, 4, 12, 00, tzinfo=FUSO),
     },
     "presenca_dia1_tarde": {
         "label":  "📅 Dia 1 — Tarde",
-        "inicio": datetime(2026, 10, 4, 13, 30, tzinfo=FUSO),
-        "fim":    datetime(2026, 10, 4, 18, 30, tzinfo=FUSO),
+        "inicio": datetime(2026, 11, 4, 13, 30, tzinfo=FUSO),
+        "fim":    datetime(2026, 11, 4, 18, 30, tzinfo=FUSO),
     },
     "presenca_dia2_manha": {
         "label":  "📅 Dia 2 — Manhã",
-        "inicio": datetime(2026, 10, 5,  7,  00, tzinfo=FUSO),
-        "fim":    datetime(2026, 10, 5, 12, 00, tzinfo=FUSO),
+        "inicio": datetime(2026, 11, 5,  7,  00, tzinfo=FUSO),
+        "fim":    datetime(2026, 11, 5, 12, 00, tzinfo=FUSO),
     },
     "presenca_dia2_tarde": {
         "label":  "📅 Dia 2 — Tarde",
-        "inicio": datetime(2026, 10, 5, 13, 30, tzinfo=FUSO),
-        "fim":    datetime(2026, 10, 5, 18, 30, tzinfo=FUSO),
+        "inicio": datetime(2026, 11, 5, 13, 30, tzinfo=FUSO),
+        "fim":    datetime(2026, 11, 5, 18, 30, tzinfo=FUSO),
     },
 }
 
