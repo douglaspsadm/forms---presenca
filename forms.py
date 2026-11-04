@@ -11,7 +11,7 @@ from streamlit_gsheets import GSheetsConnection
 # CONFIGURAÇÕES GERAIS
 # ══════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="Lista de Presença - IX ENCES", page_icon="✅")
+st.set_page_config(page_title="Lista de Presença - XI ENCES", page_icon="✅")
 
 # Fuso horário do evento
 FUSO = pytz.timezone("America/Sao_Paulo")
