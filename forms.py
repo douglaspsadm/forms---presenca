@@ -35,7 +35,7 @@ TURNOS = {
     "presenca_dia2_manha": {
         "label":  "📅 Dia 2 — Manhã",
         "inicio": datetime(2026, 11, 5,  7,  00, tzinfo=FUSO),
-        "fim":    datetime(2026, 11, 5, 11, 00, tzinfo=FUSO),
+        "fim":    datetime(2026, 11, 5, 13, 00, tzinfo=FUSO),
     },
     "presenca_dia2_tarde": {
         "label":  "📅 Dia 2 — Tarde",
